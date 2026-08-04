@@ -1,0 +1,9 @@
+[project]
+name = "86box-tool"
+version = "0.1.0"
+description = "Launch, observe, drive, and diagnose 86Box virtual machines"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
