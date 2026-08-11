@@ -142,10 +142,13 @@ Two independent paths:
    RSP_PORT=<port> ./rsp.py dump b8000 fa0
    ```
 
-   `screen` reads BIOS mode `0`, `1`, `2`, `3`, or `7`, selects 40x25 or
+   In text modes `0`, `1`, `2`, `3`, and `7`, `screen` selects 40x25 or
    80x25, uses `B8000h` for colour or `B0000h` for mono, and follows the
-   active video page. Snapshot commands pause only for inspection and detach
-   to resume.
+   active video page. In graphics mode `11h`, it reads the packed 640x480
+   1bpp framebuffer at `A0000h`, resumes the guest, and asks the harness's
+   configured `@vision` model to interpret the generated PNG. `omp` must be
+   on `PATH`; use `--vision-question` to customize the prompt. Snapshot
+   commands pause only for inspection and detach before model inference.
 
 2. **Memdump server** (no GDB stub, no CPU pause): set `memdump_port` in the
    VM config. Poll the text framebuffer with a live delta view:

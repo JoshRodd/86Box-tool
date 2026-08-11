@@ -415,6 +415,7 @@ and one-shot input:
 RSP_PORT=12345 ./rsp.py probe
 RSP_PORT=12345 ./rsp.py video-mode
 RSP_PORT=12345 ./rsp.py screen
+RSP_PORT=12345 ./rsp.py screen --vision-question "Quote the active dialog"
 RSP_PORT=12345 ./rsp.py wait-screen "PRESS F1" --wait-timeout 600
 RSP_PORT=12345 ./rsp.py type "DIR" --enter --bios-buffer
 RSP_PORT=12345 ./rsp.py type --key F1
@@ -423,18 +424,25 @@ RSP_PORT=12345 ./rsp.py trace f4300 --count 1
 ```
 
 `video-mode` reads the current mode byte at BIOS data address `00449h`.
-Supported text layouts are:
+Supported layouts are:
 
 | BIOS mode | Geometry | Video base |
 |---|---|---|
-| `0`, `1` | 40x25 colour | `B8000h` |
-| `2`, `3` | 80x25 colour | `B8000h` |
-| `7` | 80x25 monochrome | `B0000h` |
+| `0`, `1` | 40x25 colour text | `B8000h` |
+| `2`, `3` | 80x25 colour text | `B8000h` |
+| `7` | 80x25 monochrome text | `B0000h` |
+| `11h` | 640x480 1bpp graphics | `A0000h` |
 
-The active video page offset and cursor also come from the BIOS data area.
-`screen` and `wait-screen` therefore follow mode, geometry, page, and the
-`B0000h`/`B8000h` distinction automatically. Explicit address and geometry
-options remain available for diagnosis.
+For text modes, the active video page offset and cursor also come from the BIOS
+data area. `screen` and `wait-screen` therefore follow mode, geometry, page, and
+the `B0000h`/`B8000h` distinction automatically. Explicit address and geometry
+options remain available for text-mode diagnosis.
+
+In mode `11h`, `screen` reads the 38,400-byte packed monochrome framebuffer,
+encodes it as a 640x480 1bpp PNG, resumes the guest, and invokes the coding
+harness's configured `@vision` model through `omp`. `omp` must be on `PATH`.
+Use `--vision-question` to replace the default screen-reading prompt.
+`wait-screen`, `guest_console.py`, and `screenmon.py` remain text-only.
 
 ### Streaming guest console
 

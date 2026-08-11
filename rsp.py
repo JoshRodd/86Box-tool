@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import os
+from pathlib import Path
+import shutil
 import socket
+import struct
+import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import time
 from typing import Iterable, Sequence
+import zlib
 
 
 REG_EAX, REG_ESP, REG_EIP, REG_CS, REG_SS = 0, 4, 8, 10, 11
@@ -17,6 +23,57 @@ TEXT_VIDEO_ADDRESS = 0xB8000
 TEXT_COLUMNS = 80
 TEXT_ROWS = 25
 BDA_VIDEO_STATE_ADDRESS = 0x449
+VGA_GRAPHICS_ADDRESS = 0xA0000
+VGA_MODE_11 = 0x11
+VGA_MODE_11_WIDTH = 640
+VGA_MODE_11_HEIGHT = 480
+VGA_MODE_11_STRIDE = VGA_MODE_11_WIDTH // 8
+VGA_MODE_11_BYTES = VGA_MODE_11_STRIDE * VGA_MODE_11_HEIGHT
+VGA_MODE_12 = 0x12
+VGA_MODE_12_WIDTH = 640
+VGA_MODE_12_HEIGHT = 480
+VGA_MODE_12_PLANE_STRIDE = VGA_MODE_12_WIDTH // 8
+VGA_MODE_12_PLANE_BYTES = VGA_MODE_12_PLANE_STRIDE * VGA_MODE_12_HEIGHT
+VGA_MODE_12_PACKED_STRIDE = VGA_MODE_12_WIDTH // 2
+VGA_MODE_12_PACKED_BYTES = VGA_MODE_12_PACKED_STRIDE * VGA_MODE_12_HEIGHT
+VGA_GRAPHICS_INDEX_PORT = 0x3CE
+VGA_GRAPHICS_DATA_PORT = 0x3CF
+VGA_ATTRIBUTE_ADDRESS_PORT = 0x3C0
+VGA_ATTRIBUTE_DATA_PORT = 0x3C1
+VGA_DAC_STATE_PORT = 0x3C7
+VGA_DAC_WRITE_INDEX_PORT = 0x3C8
+VGA_DAC_DATA_PORT = 0x3C9
+VGA_INPUT_STATUS_1_PORT = 0x3DA
+VGA_ATTRIBUTE_MODE_CONTROL = 0x10
+VGA_ATTRIBUTE_COLOR_SELECT = 0x14
+VGA_16_COLOR_PALETTE = bytes(
+    component
+    for colour in (
+        (0x00, 0x00, 0x00),
+        (0x00, 0x00, 0xAA),
+        (0x00, 0xAA, 0x00),
+        (0x00, 0xAA, 0xAA),
+        (0xAA, 0x00, 0x00),
+        (0xAA, 0x00, 0xAA),
+        (0xAA, 0x55, 0x00),
+        (0xAA, 0xAA, 0xAA),
+        (0x55, 0x55, 0x55),
+        (0x55, 0x55, 0xFF),
+        (0x55, 0xFF, 0x55),
+        (0x55, 0xFF, 0xFF),
+        (0xFF, 0x55, 0x55),
+        (0xFF, 0x55, 0xFF),
+        (0xFF, 0xFF, 0x55),
+        (0xFF, 0xFF, 0xFF),
+    )
+    for component in colour
+)
+RSP_MEMORY_READ_CHUNK = 0x1FFF
+DEFAULT_VISION_QUESTION = (
+    "Inspect this 640x480 86Box guest display. Describe the active screen and "
+    "quote all legible text verbatim. Report any error or dialog. State "
+    "uncertainty where pixels are ambiguous."
+)
 BDA_VIDEO_STATE_SIZE = 0x1A
 BDA_KEYBOARD_HEAD = 0x41A
 BDA_KEYBOARD_TAIL = 0x41C
@@ -138,12 +195,37 @@ class RSP:
         if response not in (b"OK", b""):
             raise OSError(f"clear hardware breakpoint failed: {response!r}")
 
+    def monitor_output(self, command: str) -> str:
+        """Run an 86Box GDB monitor command and return its console output."""
+
+        self._send_packet(b"qRcmd," + command.encode().hex().encode())
+        output = bytearray()
+        while True:
+            response = self._recv_packet()
+            if response == b"OK":
+                return output.decode(errors="replace")
+            if response.startswith(b"O"):
+                try:
+                    output.extend(bytes.fromhex(response[1:].decode()))
+                except (UnicodeError, ValueError) as error:
+                    raise OSError(
+                        f"malformed monitor output for {command!r}: {response!r}"
+                    ) from error
+                continue
+            try:
+                output.extend(bytes.fromhex(response.decode()))
+            except (UnicodeError, ValueError):
+                pass
+            else:
+                return output.decode(errors="replace")
+            raise OSError(
+                f"monitor command failed: {command!r}: {response!r}"
+            )
+
     def monitor(self, command: str) -> None:
         """Run a side-effect-only 86Box GDB monitor command."""
 
-        response = self.cmd(b"qRcmd," + command.encode().hex().encode())
-        if response != b"OK":
-            raise OSError(f"monitor command failed: {command!r}: {response!r}")
+        self.monitor_output(command)
 
     def detach(self) -> None:
         try:
@@ -243,10 +325,25 @@ class VideoTextFrame:
     cells: bytes
 
 
+
+@dataclass(frozen=True)
+class VideoGraphicsFrame:
+    mode: int
+    width: int
+    height: int
+    pixels: bytes
+    palette: bytes | None = None
+
 @dataclass(frozen=True)
 class BIOSKey:
     ascii: int
     scan: int
+
+
+def read_bios_video_mode(client: RSP) -> int:
+    """Read the active BIOS video mode number from the BIOS data area."""
+
+    return client.read_mem(BDA_VIDEO_STATE_ADDRESS, 1)[0]
 
 
 def read_video_text_mode(client: RSP) -> VideoTextMode:
@@ -297,6 +394,293 @@ def read_video_text_frame(client: RSP) -> VideoTextFrame:
     mode = read_video_text_mode(client)
     cells = client.read_mem(mode.memory_address, mode.columns * mode.rows * 2)
     return VideoTextFrame(mode=mode, cells=cells)
+
+
+def _read_graphics_memory(client: RSP, length: int) -> bytes:
+    pixels = bytearray()
+    for offset in range(0, length, RSP_MEMORY_READ_CHUNK):
+        chunk = min(RSP_MEMORY_READ_CHUNK, length - offset)
+        pixels.extend(client.read_mem(VGA_GRAPHICS_ADDRESS + offset, chunk))
+    if len(pixels) != length:
+        raise ValueError(
+            f"graphics framebuffer has {len(pixels)} bytes; expected {length}"
+        )
+    return bytes(pixels)
+
+
+def read_mode_11_frame(client: RSP) -> VideoGraphicsFrame:
+    mode = read_bios_video_mode(client)
+    if mode != VGA_MODE_11:
+        raise ValueError(
+            f"BIOS video mode is {mode:#04x}, not mode {VGA_MODE_11:#04x}"
+        )
+    return VideoGraphicsFrame(
+        mode=mode,
+        width=VGA_MODE_11_WIDTH,
+        height=VGA_MODE_11_HEIGHT,
+        pixels=_read_graphics_memory(client, VGA_MODE_11_BYTES),
+    )
+
+
+def _read_io_byte(client: RSP, port: int) -> int:
+    output = client.monitor_output(f"ib {port:x} 1").strip()
+    try:
+        return int(output.rsplit(":", 1)[1].strip().split()[0], 16)
+    except (IndexError, ValueError) as error:
+        raise OSError(
+            f"malformed I/O read response for port {port:#06x}: {output!r}"
+        ) from error
+
+
+def _write_io_byte(client: RSP, port: int, value: int) -> None:
+    client.monitor(f"ob {port:x} {value & 0xFF:x}")
+
+
+def read_mode_12_palette(client: RSP) -> bytes:
+    """Read the live Attribute Controller mapping and its 16 DAC colours."""
+
+    saved_attribute = _read_io_byte(client, VGA_ATTRIBUTE_ADDRESS_PORT)
+    registers: list[int] = []
+    try:
+        for index in range(16):
+            _read_io_byte(client, VGA_INPUT_STATUS_1_PORT)
+            _write_io_byte(
+                client,
+                VGA_ATTRIBUTE_ADDRESS_PORT,
+                (saved_attribute & 0x20) | index,
+            )
+            registers.append(_read_io_byte(client, VGA_ATTRIBUTE_DATA_PORT))
+        for index in (VGA_ATTRIBUTE_MODE_CONTROL, VGA_ATTRIBUTE_COLOR_SELECT):
+            _read_io_byte(client, VGA_INPUT_STATUS_1_PORT)
+            _write_io_byte(
+                client,
+                VGA_ATTRIBUTE_ADDRESS_PORT,
+                (saved_attribute & 0x20) | index,
+            )
+            registers.append(_read_io_byte(client, VGA_ATTRIBUTE_DATA_PORT))
+    finally:
+        _read_io_byte(client, VGA_INPUT_STATUS_1_PORT)
+        _write_io_byte(client, VGA_ATTRIBUTE_ADDRESS_PORT, saved_attribute)
+
+    mode_control, color_select = registers[16:]
+    dac_indices = []
+    for value in registers[:16]:
+        middle = (
+            (color_select & 0x03) << 4
+            if mode_control & 0x80
+            else value & 0x30
+        )
+        dac_indices.append(
+            ((color_select & 0x0C) << 4) | middle | (value & 0x0F)
+        )
+
+    dac_state = _read_io_byte(client, VGA_DAC_STATE_PORT) & 0x03
+    saved_index = _read_io_byte(client, VGA_DAC_WRITE_INDEX_PORT)
+    palette = bytearray()
+    try:
+        for index in dac_indices:
+            _write_io_byte(client, VGA_DAC_STATE_PORT, index)
+            for _ in range(3):
+                component = _read_io_byte(client, VGA_DAC_DATA_PORT) & 0x3F
+                palette.append((component << 2) | (component >> 4))
+    finally:
+        if dac_state == 3:
+            _write_io_byte(client, VGA_DAC_STATE_PORT, saved_index)
+        else:
+            _write_io_byte(client, VGA_DAC_WRITE_INDEX_PORT, saved_index)
+    return bytes(palette)
+
+
+def pack_mode_12_planes(planes: Sequence[bytes]) -> bytes:
+    """Combine four MSB-first VGA planes into packed 4bpp pixel rows."""
+
+    if len(planes) != 4:
+        raise ValueError(f"mode 12h requires four planes, received {len(planes)}")
+    if any(len(plane) != VGA_MODE_12_PLANE_BYTES for plane in planes):
+        lengths = ", ".join(str(len(plane)) for plane in planes)
+        raise ValueError(
+            f"mode 12h planes must each be {VGA_MODE_12_PLANE_BYTES} bytes; "
+            f"received {lengths}"
+        )
+    packed = bytearray(VGA_MODE_12_PACKED_BYTES)
+    for offset, (plane_0, plane_1, plane_2, plane_3) in enumerate(
+        zip(*planes, strict=True)
+    ):
+        target = offset * 4
+        for pair in range(4):
+            low_bit = 6 - pair * 2
+            high_bit = low_bit + 1
+            high = (
+                ((plane_0 >> high_bit) & 1)
+                | (((plane_1 >> high_bit) & 1) << 1)
+                | (((plane_2 >> high_bit) & 1) << 2)
+                | (((plane_3 >> high_bit) & 1) << 3)
+            )
+            low = (
+                ((plane_0 >> low_bit) & 1)
+                | (((plane_1 >> low_bit) & 1) << 1)
+                | (((plane_2 >> low_bit) & 1) << 2)
+                | (((plane_3 >> low_bit) & 1) << 3)
+            )
+            packed[target + pair] = (high << 4) | low
+    return bytes(packed)
+
+
+def read_mode_12_frame(client: RSP) -> VideoGraphicsFrame:
+    mode = read_bios_video_mode(client)
+    if mode != VGA_MODE_12:
+        raise ValueError(
+            f"BIOS video mode is {mode:#04x}, not mode {VGA_MODE_12:#04x}"
+        )
+
+    original_index = _read_io_byte(client, VGA_GRAPHICS_INDEX_PORT)
+    original_read_map = original_mode = 0
+    have_read_map = have_mode = False
+    planes: list[bytes] = []
+    try:
+        _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, 4)
+        original_read_map = _read_io_byte(client, VGA_GRAPHICS_DATA_PORT)
+        have_read_map = True
+        _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, 5)
+        original_mode = _read_io_byte(client, VGA_GRAPHICS_DATA_PORT)
+        have_mode = True
+        _write_io_byte(client, VGA_GRAPHICS_DATA_PORT, original_mode & ~0x08)
+        _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, 4)
+        for plane in range(4):
+            _write_io_byte(client, VGA_GRAPHICS_DATA_PORT, plane)
+            planes.append(
+                _read_graphics_memory(client, VGA_MODE_12_PLANE_BYTES)
+            )
+    finally:
+        if have_mode:
+            _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, 5)
+            _write_io_byte(client, VGA_GRAPHICS_DATA_PORT, original_mode)
+        if have_read_map:
+            _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, 4)
+            _write_io_byte(client, VGA_GRAPHICS_DATA_PORT, original_read_map)
+        _write_io_byte(client, VGA_GRAPHICS_INDEX_PORT, original_index)
+
+    return VideoGraphicsFrame(
+        mode=mode,
+        width=VGA_MODE_12_WIDTH,
+        height=VGA_MODE_12_HEIGHT,
+        pixels=pack_mode_12_planes(planes),
+        palette=read_mode_12_palette(client),
+    )
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    body = kind + payload
+    return (
+        struct.pack(">I", len(payload))
+        + body
+        + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+    )
+
+
+def encode_monochrome_png(frame: VideoGraphicsFrame) -> bytes:
+    """Encode packed, MSB-first 1bpp rows as a dependency-free PNG."""
+
+    stride = (frame.width + 7) // 8
+    expected = stride * frame.height
+    if frame.width <= 0 or frame.height <= 0:
+        raise ValueError("frame dimensions must be positive")
+    if frame.width % 8:
+        raise ValueError("1bpp PNG width must be a multiple of 8 pixels")
+    if len(frame.pixels) != expected:
+        raise ValueError(
+            f"framebuffer has {len(frame.pixels)} bytes; expected {expected}"
+        )
+
+    scanlines = bytearray((stride + 1) * frame.height)
+    for row in range(frame.height):
+        source = row * stride
+        target = row * (stride + 1) + 1
+        scanlines[target : target + stride] = frame.pixels[source : source + stride]
+    header = struct.pack(">IIBBBBB", frame.width, frame.height, 1, 0, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(scanlines))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def encode_mode_12_png(frame: VideoGraphicsFrame) -> bytes:
+    """Encode packed 4bpp mode 12h pixels with the captured VGA palette."""
+
+    stride = (frame.width + 1) // 2
+    expected = stride * frame.height
+    if frame.width <= 0 or frame.height <= 0:
+        raise ValueError("frame dimensions must be positive")
+    if frame.width % 2:
+        raise ValueError("4bpp PNG width must be an even number of pixels")
+    if len(frame.pixels) != expected:
+        raise ValueError(
+            f"framebuffer has {len(frame.pixels)} bytes; expected {expected}"
+        )
+    scanlines = bytearray((stride + 1) * frame.height)
+    for row in range(frame.height):
+        source = row * stride
+        target = row * (stride + 1) + 1
+        scanlines[target : target + stride] = frame.pixels[source : source + stride]
+    header = struct.pack(">IIBBBBB", frame.width, frame.height, 4, 3, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"PLTE", frame.palette or VGA_16_COLOR_PALETTE)
+        + _png_chunk(b"IDAT", zlib.compress(scanlines))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def encode_graphics_png(frame: VideoGraphicsFrame) -> bytes:
+    if frame.mode == VGA_MODE_11:
+        return encode_monochrome_png(frame)
+    if frame.mode == VGA_MODE_12:
+        return encode_mode_12_png(frame)
+    raise ValueError(f"unsupported graphics mode {frame.mode:#04x}")
+
+
+def interpret_graphics_frame(
+    frame: VideoGraphicsFrame,
+    question: str = DEFAULT_VISION_QUESTION,
+) -> str:
+    """Send a graphics frame to the harness's configured vision model."""
+
+    omp = shutil.which("omp")
+    if omp is None:
+        raise OSError("cannot interpret graphics screen: omp is not on PATH")
+    with TemporaryDirectory(prefix="86box-screen-") as temporary:
+        image_path = Path(temporary) / f"mode{frame.mode:02x}.png"
+        image_path.write_bytes(encode_graphics_png(frame))
+        command = [
+            omp,
+            "--print",
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--no-lsp",
+            "--model",
+            "@vision",
+            "--system-prompt",
+            (
+                "You are a precise visual screen reader. Answer only from the "
+                "attached image and do not infer hidden state."
+            ),
+            f"@{image_path}",
+            question,
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    answer = result.stdout.strip()
+    if result.returncode:
+        detail = result.stderr.strip() or answer or f"exit status {result.returncode}"
+        raise OSError(f"vision model failed: {detail}")
+    if not answer:
+        raise OSError("vision model returned no interpretation")
+    return answer
 
 
 _ASCII_SCANS = {
@@ -619,12 +1003,25 @@ def _argument_parser() -> argparse.ArgumentParser:
     dump.add_argument("address", type=_hex_integer)
     dump.add_argument("length", type=_hex_integer)
 
-    commands.add_parser("video-mode", help="inspect the active BIOS text mode")
+    commands.add_parser("video-mode", help="inspect the active BIOS video mode")
 
-    screen = commands.add_parser("screen", help="render the active BIOS text screen")
+    screen = commands.add_parser(
+        "screen",
+        help="render text VRAM or interpret a mode 11h graphics screen",
+    )
     screen.add_argument("--address", type=_hex_integer)
     screen.add_argument("--columns", type=int)
     screen.add_argument("--rows", type=int)
+    screen.add_argument(
+        "--png",
+        type=Path,
+        help="write a graphics-mode capture to this PNG instead of invoking vision",
+    )
+    screen.add_argument(
+        "--vision-question",
+        default=DEFAULT_VISION_QUESTION,
+        help="question sent with a mode 11h screen to the harness vision model",
+    )
 
     wait_screen = commands.add_parser(
         "wait-screen",
@@ -689,16 +1086,32 @@ def _video_mode(options: argparse.Namespace) -> int:
     client = _connect(options)
     try:
         client.break_cpu()
-        mode = read_video_text_mode(client)
+        number = read_bios_video_mode(client)
+        if number == VGA_MODE_11:
+            detail = (
+                f"mode {number} (0x11): {VGA_MODE_11_WIDTH}x{VGA_MODE_11_HEIGHT} "
+                f"1bpp graphics, base {VGA_GRAPHICS_ADDRESS:05X}h, "
+                f"{VGA_MODE_11_BYTES} bytes"
+            )
+        elif number == VGA_MODE_12:
+            detail = (
+                f"mode {number} (0x12): {VGA_MODE_12_WIDTH}x{VGA_MODE_12_HEIGHT} "
+                f"4bpp planar graphics, base {VGA_GRAPHICS_ADDRESS:05X}h, "
+                f"4 x {VGA_MODE_12_PLANE_BYTES} bytes"
+            )
+        else:
+            mode = read_video_text_mode(client)
+            kind = "colour" if mode.colour else "mono"
+            detail = (
+                f"mode {mode.number}: {mode.columns}x{mode.rows} {kind}, "
+                f"base {mode.base_address:05X}h, page {mode.active_page}, "
+                f"offset {mode.page_offset:04X}h, "
+                f"address {mode.memory_address:05X}h, "
+                f"cursor {mode.cursor_row},{mode.cursor_column}"
+            )
     finally:
         client.detach()
-    kind = "colour" if mode.colour else "mono"
-    print(
-        f"mode {mode.number}: {mode.columns}x{mode.rows} {kind}, "
-        f"base {mode.base_address:05X}h, page {mode.active_page}, "
-        f"offset {mode.page_offset:04X}h, address {mode.memory_address:05X}h, "
-        f"cursor {mode.cursor_row},{mode.cursor_column}"
-    )
+    print(detail)
     return 0
 
 
@@ -768,11 +1181,35 @@ def _type_keys(options: argparse.Namespace) -> int:
 
 def _screen(options: argparse.Namespace) -> int:
     client = _connect(options)
+    graphics = None
+    text = ""
     try:
         client.break_cpu()
-        _, text = _selected_text_screen(client, options)
+        number = read_bios_video_mode(client)
+        if number in (VGA_MODE_11, VGA_MODE_12):
+            if any(
+                value is not None
+                for value in (options.address, options.columns, options.rows)
+            ):
+                raise ValueError(
+                    "--address, --columns, and --rows apply only to text modes"
+                )
+            if number == VGA_MODE_11:
+                graphics = read_mode_11_frame(client)
+            else:
+                graphics = read_mode_12_frame(client)
+        else:
+            _, text = _selected_text_screen(client, options)
     finally:
         client.detach()
+    if graphics is not None:
+        if options.png is not None:
+            options.png.write_bytes(encode_graphics_png(graphics))
+            text = str(options.png)
+        else:
+            text = interpret_graphics_frame(graphics, options.vision_question)
+    elif options.png is not None:
+        raise ValueError("--png requires VGA graphics mode 11h or 12h")
     print(text)
     return 0
 

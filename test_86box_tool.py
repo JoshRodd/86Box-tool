@@ -5,9 +5,13 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import struct
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+import zlib
 
 
 TOOL_DIRECTORY = Path(__file__).resolve().parent
@@ -523,6 +527,110 @@ class RspRenderingTests(unittest.TestCase):
             cells.extend((character, 0x1F))
         rendered = rsp.render_text_screen(bytes(cells), columns=4, rows=1)
         self.assertEqual(rendered, "A █")
+
+    def test_mode_11_frame_encodes_exact_packed_pixels_as_png(self) -> None:
+        rsp = _load_rsp_module()
+
+        class MemoryClient:
+            def __init__(self) -> None:
+                self.memory = bytearray(0x100000)
+
+            def read_mem(self, address: int, length: int) -> bytes:
+                return bytes(self.memory[address : address + length])
+
+        client = MemoryClient()
+        client.memory[rsp.BDA_VIDEO_STATE_ADDRESS] = rsp.VGA_MODE_11
+        pixels = bytes(
+            (index * 37) & 0xFF for index in range(rsp.VGA_MODE_11_BYTES)
+        )
+        client.memory[
+            rsp.VGA_GRAPHICS_ADDRESS :
+            rsp.VGA_GRAPHICS_ADDRESS + len(pixels)
+        ] = pixels
+
+        frame = rsp.read_mode_11_frame(client)
+        self.assertEqual((frame.width, frame.height), (640, 480))
+        self.assertEqual(frame.pixels, pixels)
+
+        png = rsp.encode_monochrome_png(frame)
+        self.assertEqual(png[:8], b"\x89PNG\r\n\x1a\n")
+        chunks: dict[bytes, bytes] = {}
+        offset = 8
+        while offset < len(png):
+            size = struct.unpack_from(">I", png, offset)[0]
+            kind = png[offset + 4 : offset + 8]
+            payload = png[offset + 8 : offset + 8 + size]
+            chunks[kind] = payload
+            offset += 12 + size
+        self.assertEqual(
+            struct.unpack(">IIBBBBB", chunks[b"IHDR"]),
+            (640, 480, 1, 0, 0, 0, 0),
+        )
+        scanlines = zlib.decompress(chunks[b"IDAT"])
+        self.assertEqual(len(scanlines), 480 * 81)
+        for row in range(480):
+            start = row * 81
+            self.assertEqual(scanlines[start], 0)
+            self.assertEqual(
+                scanlines[start + 1 : start + 81],
+                pixels[row * 80 : (row + 1) * 80],
+            )
+
+    def test_mode_12_planes_encode_as_indexed_4bpp_png(self) -> None:
+        rsp = _load_rsp_module()
+        planes = []
+        for first in (0xAA, 0xCC, 0xF0, 0x0F):
+            plane = bytearray(rsp.VGA_MODE_12_PLANE_BYTES)
+            plane[0] = first
+            planes.append(bytes(plane))
+
+        packed = rsp.pack_mode_12_planes(planes)
+        self.assertEqual(len(packed), rsp.VGA_MODE_12_PACKED_BYTES)
+        self.assertEqual(packed[:4], b"\x76\x54\xBA\x98")
+        self.assertFalse(any(packed[4:]))
+
+        frame = rsp.VideoGraphicsFrame(
+            rsp.VGA_MODE_12,
+            rsp.VGA_MODE_12_WIDTH,
+            rsp.VGA_MODE_12_HEIGHT,
+            packed,
+        )
+        png = rsp.encode_graphics_png(frame)
+        chunks: dict[bytes, bytes] = {}
+        offset = 8
+        while offset < len(png):
+            size = struct.unpack_from(">I", png, offset)[0]
+            kind = png[offset + 4 : offset + 8]
+            chunks[kind] = png[offset + 8 : offset + 8 + size]
+            offset += 12 + size
+        self.assertEqual(
+            struct.unpack(">IIBBBBB", chunks[b"IHDR"]),
+            (640, 480, 4, 3, 0, 0, 0),
+        )
+        self.assertEqual(chunks[b"PLTE"], rsp.VGA_16_COLOR_PALETTE)
+
+    def test_graphics_interpreter_invokes_harness_vision_role(self) -> None:
+        rsp = _load_rsp_module()
+        frame = rsp.VideoGraphicsFrame(0x11, 640, 480, bytes(80 * 480))
+        observed: list[str] = []
+
+        def run(command, **options):
+            observed.extend(command)
+            image_argument = next(item for item in command if item.startswith("@/"))
+            self.assertTrue(Path(image_argument[1:]).read_bytes().startswith(b"\x89PNG"))
+            self.assertEqual(options["capture_output"], True)
+            self.assertEqual(options["text"], True)
+            return SimpleNamespace(returncode=0, stdout="Visible dialog", stderr="")
+
+        with (
+            patch.object(rsp.shutil, "which", return_value="/opt/bin/omp"),
+            patch.object(rsp.subprocess, "run", side_effect=run),
+        ):
+            answer = rsp.interpret_graphics_frame(frame, "Read this screen")
+
+        self.assertEqual(answer, "Visible dialog")
+        self.assertIn("@vision", observed)
+        self.assertIn("Read this screen", observed)
 
 
     def test_screenmon_choose_mode_honors_isatty_and_overrides(self) -> None:
