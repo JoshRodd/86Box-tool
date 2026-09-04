@@ -1,0 +1,328 @@
+From 93306e337d96e028eabcbcdb05115ff16970acea Mon Sep 17 00:00:00 2001
+From: Josh Rodd <josh@rodd.us>
+Date: Fri, 4 Sep 2026 09:50:22 -0400
+Subject: [PATCH 1/2] Add memdump server for external guest memory observation
+
+Add a TCP memory-dump server (src/memdump.c) so external tools can poll
+guest memory (e.g. the text framebuffer) without a debugger attach.
+
+- memdump_port setting under [General] (0 = disabled, the default),
+  loaded and saved by the config system
+- memdump_init()/memdump_close() hooks in machine_init() and pc_close()
+
+Assisted-by: oh-my-pi:glm-5.3
+---
+ src/86box.c                 |   3 +
+ src/CMakeLists.txt          |   2 +
+ src/config.c                |   6 ++
+ src/include/86box/86box.h   |   1 +
+ src/include/86box/memdump.h |   7 ++
+ src/machine/machine.c       |   2 +
+ src/memdump.c               | 184 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 205 insertions(+)
+ create mode 100644 src/include/86box/memdump.h
+ create mode 100644 src/memdump.c
+
+diff --git a/src/86box.c b/src/86box.c
+index 32263a9eb..86043860a 100644
+--- a/src/86box.c
++++ b/src/86box.c
+@@ -47,6 +47,7 @@
+ #include <86box/86box.h>
+ #include <86box/config.h>
+ #include <86box/mem.h>
++#include <86box/memdump.h>
+ #include "cpu.h"
+ #ifdef USE_DYNAREC
+ #    include "codegen_public.h"
+@@ -233,6 +234,7 @@ int      fdd_sounds_enabled = 1;                                  /* (C) Floppy
+ int      is_new_808x = 0;                                         /* (C) Use the new 808x code. */
+ 
+ int      gdbstub_port = 12345;                                    /* (C) The GDB stub port. */
++int      memdump_port = 0;                                       /* (C) The memory-dump server port (0 = disabled). */
+ 
+ // Accelerator key array
+ struct accelKey acc_keys[NUM_ACCELS];
+@@ -1974,6 +1976,7 @@ pc_close(UNUSED(thread_t *ptr))
+     scsi_disk_close();
+ 
+     gdbstub_close();
++    memdump_close();
+ 
+ }
+ 
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 456d80c73..68c6ba16a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -65,6 +65,8 @@ if(GDBSTUB)
+     target_sources(86Box PRIVATE gdbstub.c)
+ endif()
+ 
++target_sources(86Box PRIVATE memdump.c)
++
+ if(NEW_DYNAREC)
+     add_compile_definitions(USE_NEW_DYNAREC)
+ endif()
+diff --git a/src/config.c b/src/config.c
+index 2ea30a292..37e18d766 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -396,6 +396,7 @@ load_general(void)
+         strncpy(uuid, "", sizeof(uuid) - 1);
+ 
+     gdbstub_port = ini_section_get_int(cat, "gdbstub_port", 12345);
++    memdump_port = ini_section_get_int(cat, "memdump_port", 0);
+ }
+ 
+ /* Load monitor section. */
+@@ -3133,6 +3134,11 @@ save_general(void)
+     else
+         ini_section_set_int(cat, "gdbstub_port", gdbstub_port);
+ 
++    if (memdump_port == 0)
++        ini_section_delete_var(cat, "memdump_port");
++    else
++        ini_section_set_int(cat, "memdump_port", memdump_port);
++
+     ini_delete_section_if_empty(config, cat);
+ }
+ 
+diff --git a/src/include/86box/86box.h b/src/include/86box/86box.h
+index 4fc58119e..c41332292 100644
+--- a/src/include/86box/86box.h
++++ b/src/include/86box/86box.h
+@@ -248,6 +248,7 @@ extern int    hook_enabled;                 /* (C) Keyboard hook is enabled */
+ extern int    vmm_disabled;                 /* (G) disable built-in manager */
+ extern char   vmm_path_cfg[1024];           /* (G) VMs path (unless -E is used) */
+ extern int    gdbstub_port;                 /* (C) The GDB stub port. */
++extern int    memdump_port;                 /* (C) The memory-dump server port. */
+ 
+ extern char exe_path[2048];        /* path (dir) of executable */
+ extern char usr_path[1024];        /* path (dir) of user data */
+diff --git a/src/include/86box/memdump.h b/src/include/86box/memdump.h
+new file mode 100644
+index 000000000..0941eb4e8
+--- /dev/null
++++ b/src/include/86box/memdump.h
+@@ -0,0 +1,7 @@
++#ifndef MEMDUMP_H
++#define MEMDUMP_H
++
++extern void memdump_init(void);
++extern void memdump_close(void);
++
++#endif
+diff --git a/src/machine/machine.c b/src/machine/machine.c
+index ce81026e8..4d19d6d32 100644
+--- a/src/machine/machine.c
++++ b/src/machine/machine.c
+@@ -29,6 +29,7 @@
+ #include <86box/pic.h>
+ #include <86box/pit.h>
+ #include <86box/mem.h>
++#include <86box/memdump.h>
+ #include <86box/rom.h>
+ #include <86box/lpt.h>
+ #include <86box/serial.h>
+@@ -153,6 +154,7 @@ machine_init(void)
+     if (!gdbstub_started) {
+         gdbstub_started = 1;
+         gdbstub_init();
++        memdump_init();
+     }
+ 
+     (void) machine_init_ex(machine);
+diff --git a/src/memdump.c b/src/memdump.c
+new file mode 100644
+index 000000000..4b5da68ab
+--- /dev/null
++++ b/src/memdump.c
+@@ -0,0 +1,184 @@
++/*
++ * 86Box memory dump server.
++ *
++ * A tiny socket server that answers "dump guest physical memory" requests
++ * from a dedicated thread.  Unlike the GDB stub, it NEVER touches the CPU
++ * state: reads go straight to the emulated memory arrays (the ram-backed
++ * pages resolve through readlookup2 to a direct pointer; device-mapped
++ * pages such as the video window go through the registered mapping's byte
++ * read).  The caller accepts tearing, so the data races against the
++ * emulation thread are benign.
++ *
++ * Protocol (one request per connection):
++ *   request:  "<hex-address>:<hex-length>\n"
++ *   response: "<length*2 hex characters>\n"
++ *
++ * The gdb-stub port must stay untouched: this is the CPU-suspension-free
++ * path the diagnostics tool uses to poll the guest screen.
++ */
++
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <86box/86box.h>
++#include <cpu.h>
++#include <86box/mem.h>
++#include <86box/memdump.h>
++#include <86box/thread.h>
++
++#ifdef _WIN32
++#    include <winsock2.h>
++#    include <ws2tcpip.h>
++#else
++#    include <arpa/inet.h>
++#    include <netinet/in.h>
++#    include <sys/socket.h>
++#    include <unistd.h>
++#endif
++
++static int       memdump_socket = -1;
++static volatile int memdump_running = 0;
++
++/* Read one guest-physical byte without involving the CPU. */
++static uint8_t
++memdump_read_byte(uint32_t addr)
++{
++    uintptr_t      ptr = readlookup2[addr >> 12];
++    mem_mapping_t *map;
++
++    if (ptr != (uintptr_t) LOOKUP_INV)
++        return *(uint8_t *) (ptr + addr);
++
++    map = read_mapping[addr >> MEM_GRANULARITY_BITS];
++    if (map && map->read_b)
++        return map->read_b(addr, map->priv);
++
++    return 0xff;
++}
++
++static void
++memdump_server_thread(void *priv)
++{
++    struct sockaddr_in client_addr;
++    socklen_t          client_len = sizeof(client_addr);
++    char               request[64];
++    char               reply[4096];
++    char              *buf = NULL;
++    uint32_t           addr;
++    uint32_t           len;
++    ssize_t            n;
++
++    (void) priv;
++
++    while (memdump_running) {
++        int conn = accept(memdump_socket, (struct sockaddr *) &client_addr, &client_len);
++        if (conn < 0) {
++            if (!memdump_running)
++                break;
++            continue;
++        }
++
++        n = 0;
++        while (n < (ssize_t) (sizeof(request) - 1)) {
++            ssize_t r = recv(conn, request + n, 1, 0);
++            if (r <= 0)
++                break;
++            n += r;
++            if (request[n - 1] == '\n')
++                break;
++        }
++        request[n] = '\0';
++
++        addr = 0;
++        len  = 0;
++        if (sscanf(request, "%x:%x", &addr, &len) == 2 && len <= 0x1000) {
++            if (len * 2 + 1 <= sizeof(reply)) {
++                for (uint32_t i = 0; i < len; i++)
++                    sprintf(reply + i * 2, "%02x", memdump_read_byte(addr + i));
++                send(conn, reply, (int) (len * 2), 0);
++            } else {
++                buf = (char *) malloc((size_t) len * 2 + 1);
++                if (buf != NULL) {
++                    for (uint32_t i = 0; i < len; i++)
++                        sprintf(buf + i * 2, "%02x", memdump_read_byte(addr + i));
++                    send(conn, buf, (int) (len * 2), 0);
++                    free(buf);
++                }
++            }
++        }
++        send(conn, "\n", 1, 0);
++
++#ifdef _WIN32
++        closesocket(conn);
++#else
++        close(conn);
++#endif
++    }
++}
++
++void
++memdump_init(void)
++{
++    struct sockaddr_in bind_addr;
++
++    if (memdump_port <= 0)
++        return;
++
++#ifdef _WIN32
++    WSADATA wsa;
++    WSAStartup(MAKEWORD(2, 2), &wsa);
++#endif
++
++    memdump_socket = socket(AF_INET, SOCK_STREAM, 0);
++    if (memdump_socket == -1) {
++        pclog("MemDump: failed to create socket\n");
++        return;
++    }
++
++    int yes = 1;
++    setsockopt(memdump_socket, SOL_SOCKET, SO_REUSEADDR,
++#ifdef _WIN32
++               (const char *) &yes,
++#else
++               &yes,
++#endif
++               sizeof(yes));
++
++    bind_addr.sin_family      = AF_INET;
++    bind_addr.sin_addr.s_addr = INADDR_ANY;
++    bind_addr.sin_port        = htons((uint16_t) memdump_port);
++
++    if (bind(memdump_socket, (struct sockaddr *) &bind_addr, sizeof(bind_addr)) == -1) {
++        pclog("MemDump: failed to bind on port %d\n", memdump_port);
++        return;
++    }
++    if (listen(memdump_socket, 1) == -1) {
++        pclog("MemDump: failed to listen on port %d\n", memdump_port);
++        return;
++    }
++
++    memdump_running = 1;
++    pclog("MemDump: Listening on port %d\n", memdump_port);
++    thread_create(memdump_server_thread, NULL);
++}
++
++void
++memdump_close(void)
++{
++    if (memdump_socket < 0)
++        return;
++
++    memdump_running = 0;
++#ifdef _WIN32
++    shutdown(memdump_socket, SD_BOTH);
++    closesocket(memdump_socket);
++    WSACleanup();
++#else
++    shutdown(memdump_socket, SHUT_RDWR);
++    close(memdump_socket);
++#endif
++    memdump_socket = -1;
++}
+-- 
+2.54.0 (Apple Git-157)
+

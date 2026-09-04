@@ -45,6 +45,10 @@ uv run python -m unittest test_86box_tool -v
 
 ### Enabling the memdump server
 
+You will need a build of 86Box with the memdump patch applied. Apply
+`0001-Add-memdump-server-for-external-guest-memory-observa.patch`
+to your current source tree and build.
+
 Add to the VM's `86box.cfg`:
 
 ```ini
