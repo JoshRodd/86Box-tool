@@ -1,5 +1,10 @@
 # 86Box-tool — safe launch, lifecycle, and guest observation
 
+WARNING - WARNING - WARNING - this repo is almost entirely AI generated
+and has had very little human review!
+
+Last updated 2026-09-04
+
 A dependency-free toolkit (standard library only, managed with uv) for
 running several 86Box VMs concurrently without confusing their processes,
 files, ROMs, or debugger ports, and for observing and driving the guests.
