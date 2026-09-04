@@ -276,12 +276,17 @@ class MemDump:
         with socket.create_connection(self.addr, timeout=self.timeout) as conn:
             conn.sendall(f"dr {address:x} {length:x}\n".encode())
             response = bytearray()
-            while len(response) < length * 2 + 1:
+            while len(response) < length * 2 + 3:
                 chunk = conn.recv(4096)
                 if not chunk:
                     break
                 response.extend(chunk)
-        text = response.decode(errors="replace").strip()
+        text = response.decode(errors="replace")
+        # Strip the DEBUG-style "- " prompt that precedes and trails the
+        # reply; raw dumps never contain "- " themselves.
+        while text.startswith("- "):
+            text = text[2:]
+        text = text.strip().rstrip("-").strip()
         data = bytes.fromhex(text)
         if len(data) != length:
             raise OSError(f"short memdump response: expected {length}, received {len(data)}")
