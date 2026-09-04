@@ -274,7 +274,7 @@ class MemDump:
         if address < 0 or length < 0:
             raise ValueError("address and length must be non-negative")
         with socket.create_connection(self.addr, timeout=self.timeout) as conn:
-            conn.sendall(f"{address:x}:{length:x}\n".encode())
+            conn.sendall(f"dr {address:x} {length:x}\n".encode())
             response = bytearray()
             while len(response) < length * 2 + 1:
                 chunk = conn.recv(4096)
